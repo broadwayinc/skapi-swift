@@ -41,7 +41,7 @@ for post in posts["list"]?.array ?? [] {
 - Realtime messages between users, in groups or one to one, over a WebSocket that reconnects when the app comes back to the foreground.
 - Optional encryption of private records on the device, compatible with skapi-js and skapi-py, with "remember this device" through the Keychain.
 
-Documentation: https://docs.skapi.com
+Documentation: https://ios.skapi.com
 
 ## License
 
