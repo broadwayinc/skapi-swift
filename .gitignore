@@ -1,0 +1,15 @@
+# Swift Package Manager
+.build/
+.swiftpm/
+/Packages
+Package.resolved
+
+# Xcode
+xcuserdata/
+DerivedData/
+*.xcuserstate
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
