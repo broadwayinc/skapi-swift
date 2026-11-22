@@ -21,7 +21,7 @@ public struct SkapiError: Error, CustomStringConvertible, LocalizedError, @unche
 }
 
 /// The SDK version, the same number as skapi-js and skapi-py.
-public let skapiVersion = "2.4.0"
+public let skapiVersion = "2.4.4"
 
 func paramError(_ message: String, _ code: String = "INVALID_PARAMETER") -> SkapiError {
     SkapiError(message, code: code)

@@ -90,7 +90,8 @@ public actor Skapi {
     /// storage: where the signed-in session is kept between launches. Default: the Keychain on
     ///   iOS and macOS (one Keychain service per project), memory elsewhere. Pass `MemoryStorage()`
     ///   to forget the session when the object goes away, or your own `SkapiStorage`.
-    /// timeout: seconds to wait for each request.
+    /// timeout: seconds a request may go with nothing sent or received before it fails with TIMEOUT
+    ///   (default 120).
     /// encryption: seals the data of private records on this device before upload (see
     ///   `EncryptionOptions`).
     /// observeAppLifecycle: when the app comes back to the foreground or the network returns,

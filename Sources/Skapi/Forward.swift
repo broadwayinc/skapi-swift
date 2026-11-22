@@ -149,11 +149,23 @@ extension Skapi {
         return try await dispatchForward(params, onStream: onStream, responseType: responseType)
     }
 
+    /// The shortest polling interval accepted, in milliseconds (skapi-js 2.4.4). A shorter one is refused
+    /// with INVALID_PARAMETER, never raised quietly: forwardRequest's "poll" (0 still means "do not poll"),
+    /// forwardRequestPoll's `poll` and forwardRequestStream's "poll".
+    public static let minPollIntervalMs: Double = 1000
+
+    static func assertPollInterval(_ value: Double, _ name: String = "poll") throws {
+        if !value.isFinite || value < minPollIntervalMs {
+            throw paramError("\"\(name)\" should be a number of milliseconds, \(Int(minPollIntervalMs)) or more.")
+        }
+    }
+
     private func dispatchForward(_ paramsIn: JSONObject, onStream: (@Sendable (String, Int) -> Void)?, responseType: String?) async throws -> JSON {
         var params = paramsIn
         let secretNamed = params["secretName"].truthy
         let poll = params.removeValue(forKey: "poll")
-        if let n = poll?.number, n < 0 { throw paramError("\"poll\" should be a non-negative number.") }
+        // 0 (or false, or absent) means "do not poll"; any other number is the interval.
+        if let n = poll?.number, n != 0 { try Skapi.assertPollInterval(n) }
         let latency: Double = poll?.number ?? ((poll?.truthy ?? false) ? 1000 : 0)
         try await ensureConnection()
         let signedIn = await self.signedIn()
@@ -249,11 +261,11 @@ extension Skapi {
     }
 
     /// Waits for a queued request (its request_id, or its short id with url and method) and returns the answer.
-    /// poll: milliseconds between checks.
+    /// poll: milliseconds between checks, 1000 or more (0 means the default, 1000).
     public func forwardRequestPoll(_ requestId: String, poll: Double = 1000, url: String? = nil, method: String? = nil,
                                    onStream: (@Sendable (String, Int) -> Void)? = nil, service: String? = nil, owner: String? = nil) async throws -> JSON {
-        if poll < 0 { throw paramError("\"poll\" should be a non-negative number.") }
         let wait = poll == 0 ? 1000 : poll
+        try Skapi.assertPollInterval(wait)
         let fullId = try self.requestId(requestId, url: url, method: method, service: service)
         try await ensureConnection()
         var cursor = 0, stalled = 0
@@ -284,7 +296,7 @@ extension Skapi {
     public func forwardRequestStream(_ requestId: String, options: JSON? = nil, onStream: (@Sendable (String, Int) -> Void)? = nil) async throws -> JSON {
         let o = options?.object ?? JSONObject()
         let latency = o["poll"]?.number ?? 1000
-        if latency < 0 { throw paramError("\"poll\" should be a non-negative number.") }
+        try Skapi.assertPollInterval(latency)
         if let s = o["since"], !s.isNumber { throw paramError("\"since\" should be a number.") }
         let fullId = try self.requestId(requestId, url: o["url"]?.string, method: o["method"]?.string, service: o["service"]?.string)
         try await ensureConnection()

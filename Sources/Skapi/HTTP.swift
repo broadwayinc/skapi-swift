@@ -13,6 +13,15 @@ struct HTTPAnswer {
 /// A network failure (no answer at all).
 struct NetworkFailure: Error {
     let underlying: Error
+
+    /// TIMEOUT when nothing moved for `timeout` seconds (URLRequest.timeoutInterval is an idle limit),
+    /// as skapi-js 2.4.4 does ("No response for 60 seconds."); NETWORK_ERROR for any other failure.
+    func skapiError(timeout: TimeInterval) -> SkapiError {
+        if (underlying as? URLError)?.code == .timedOut {
+            return SkapiError("No response for \(Int(timeout)) seconds.", code: "TIMEOUT", cause: underlying)
+        }
+        return SkapiError("Network error", code: "NETWORK_ERROR", cause: underlying)
+    }
 }
 
 enum HTTP {
@@ -326,7 +335,11 @@ final class Requester: @unchecked Sendable {
         return meta.jsonString
     }
 
-    func send(url: String, method: String, headers: [String: String], payload: Data?, raw: Bool = false) async throws -> Result {
+    /// `uploadName`: set by `upload`, so a stalled upload is reported as TIMEOUT. URLRequest's
+    /// timeoutInterval is an idle limit (it restarts whenever bytes move, upload bytes included) and
+    /// URLSession.shared allows 7 days in total, so a slow upload that keeps moving is never cut off.
+    func send(url: String, method: String, headers: [String: String], payload: Data?, raw: Bool = false,
+              uploadName: String? = nil) async throws -> Result {
         guard let u = URL(string: url) else { throw paramError("\"\(url)\" is an invalid url.") }
         var attempt = 0
         while true {
@@ -339,7 +352,11 @@ final class Requester: @unchecked Sendable {
             do {
                 answer = try await HTTP.send(req, session: session)
             } catch let e as NetworkFailure {
-                throw SkapiError("Network error", code: "NETWORK_ERROR", cause: e.underlying)
+                if let name = uploadName, (e.underlying as? URLError)?.code == .timedOut {
+                    throw SkapiError("Upload timeout: \"\(name)\" stalled (nothing moved for \(Int(timeout)) seconds).",
+                                     code: "TIMEOUT", cause: e.underlying)
+                }
+                throw e.skapiError(timeout: timeout)
             }
             if (200..<300).contains(answer.status) {
                 if raw { return Result(json: .null, bytes: answer.body) }
@@ -416,7 +433,7 @@ final class Requester: @unchecked Sendable {
         do {
             answer = try await HTTP.send(req, session: session)
         } catch let e as NetworkFailure {
-            throw SkapiError("Network error", code: "NETWORK_ERROR", cause: e.underlying)
+            throw e.skapiError(timeout: timeout)
         }
         if (200..<300).contains(answer.status) { return answer.body }
         let text = String(decoding: answer.body, as: UTF8.self)
@@ -444,7 +461,8 @@ final class Requester: @unchecked Sendable {
                       "Content-Type: \(contentType ?? "application/octet-stream")\r\n\r\n").utf8)
         body += content
         body += Data("\r\n--\(boundary)--\r\n".utf8)
-        _ = try await send(url: url, method: "POST", headers: ["Content-Type": "multipart/form-data; boundary=\(boundary)"], payload: body)
+        _ = try await send(url: url, method: "POST", headers: ["Content-Type": "multipart/form-data; boundary=\(boundary)"], payload: body,
+                           uploadName: filename)
     }
 }
 
