@@ -27,6 +27,8 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto", condition: .when(platforms: [.linux])),
             ]
         ),
+        // Offline checks of record decoding (`swift test`). No network calls.
+        .testTarget(name: "SkapiTests", dependencies: ["Skapi"]),
     ],
     swiftLanguageVersions: [.v5]
 )
