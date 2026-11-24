@@ -376,7 +376,8 @@ extension Skapi {
                 if n < 0 { throw DB.err("\"reference_limit\" should be >= 0") }
                 if n > 4503599627370546 { throw DB.err("\"reference_limit\" should be <= 4503599627370546") }
             }
-            for k in ["prevent_multiple_referencing", "can_remove_referencing_records", "only_granted_can_reference", "allow_granted_to_grant_others"] {
+            for k in ["prevent_multiple_referencing", "can_remove_referencing_records", "can_modify_referencing_records",
+                      "only_granted_can_reference", "allow_granted_to_grant_others"] {
                 if let v = s[k], !v.isBool { throw DB.err("\"source.\(k)\" should be type: <boolean>.") }
             }
             if let r = s["referencing_index_restrictions"] {
@@ -481,6 +482,9 @@ extension Skapi {
     /// Creates a record, or updates one when config has "record_id".
     /// data: any JSON value. Leave it out (nil) on an update to keep the stored data; `.null` stores null.
     /// config: ["table": ["name", "access_group"], "index", "tags", "reference", "unique_id", "readonly", "source", "remove_bin", ...].
+    /// source["can_modify_referencing_records"] = true lets you update the "data", "tags" and "index" of other users'
+    /// records that reference this one, or unlink them with "reference": nil (and nothing else of them). It can be
+    /// turned on only when the record is created (later, only by the project owner or access group 99), and off at any time.
     /// files: files to attach, listed in the record's "bin".
     @discardableResult
     public func postRecord(_ data: JSON? = nil, config: JSON, files: [UploadFile]? = nil) async throws -> JSON {
@@ -999,7 +1003,7 @@ extension Skapi {
                                                                       "notify_referencing_records": false]],
             "referenced_count": 0,
             "source": ["referencing_limit": nil, "prevent_multiple_referencing": false, "can_remove_referencing_records": false,
-                       "only_granted_can_reference": false],
+                       "can_modify_referencing_records": false, "only_granted_can_reference": false],
             "ip": "", "bin": .object(JSONObject()),
         ]
         var table = out["table"]!.object!
@@ -1025,7 +1029,11 @@ extension Skapi {
         let ctURL = ctURLs.first
 
         if let ipv = record["ip"] {
-            let parts = ipv.pyString.components(separatedBy: "#")
+            // Stored as "<ip>[R]#<unique_id>". The address is redacted for anyone but the uploader, the
+            // project owner and admins in access group 99: it comes back empty ("R#<unique_id>", "#<unique_id>"
+            // or "") for a signed-in uploader and as 0-0-0-0 for an anonymous one, so the readonly flag, the
+            // unique_id and the anonymous check below still hold. A missing (null) value reads as "".
+            let parts = (ipv.string ?? "").components(separatedBy: "#")
             var ip = parts[0]
             if parts.count > 1 { out["unique_id"] = .string(parts.dropFirst().joined(separator: "#")) }
             if ip.hasSuffix("R") {
@@ -1096,7 +1104,13 @@ extension Skapi {
         out["bin"] = .object(bin)
         if let prv = record["prv_acs"]?.object {
             for (k, v) in prv {
-                if ["notify_subscribers", "upload_to_feed", "feed_referencing_records", "notify_referencing_records"].contains(k) {
+                if k == "upb" {
+                    // Not a source setting: the user id of whoever last updated this record when that was not
+                    // its uploader (the referenced record's owner through can_modify_referencing_records, the
+                    // project owner or an admin). The server keeps it in prv_acs and drops it once the uploader
+                    // updates the record again.
+                    if let u = v.string, !u.isEmpty { out["updated_by"] = .string(u) }
+                } else if ["notify_subscribers", "upload_to_feed", "feed_referencing_records", "notify_referencing_records"].contains(k) {
                     subscription[k] = v
                 } else if k == "referencing_index_restrictions", let list = v.array {
                     source[k] = .array(list.map { i in
