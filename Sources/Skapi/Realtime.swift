@@ -98,25 +98,20 @@ final class WebSocketConnection: NSObject, URLSessionWebSocketDelegate, @uncheck
 
     func send(_ text: String) async throws {
         if isClosed { throw URLError(.networkConnectionLost) }
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            task.send(.string(text)) { error in
-                if let e = error { c.resume(throwing: e) } else { c.resume() }
-            }
-        }
+        // The async forms: Foundation on Linux has no completion-handler send or receive.
+        try await task.send(.string(text))
     }
 
     func receive() async throws -> String {
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<String, Error>) in
-            task.receive { [weak self] result in
-                switch result {
-                case .success(.string(let s)): c.resume(returning: s)
-                case .success(.data(let d)): c.resume(returning: String(decoding: d, as: UTF8.self))
-                case .success: c.resume(returning: "")
-                case .failure(let e):
-                    self?.markClosed()
-                    c.resume(throwing: e)
-                }
+        do {
+            switch try await task.receive() {
+            case .string(let s): return s
+            case .data(let d): return String(decoding: d, as: UTF8.self)
+            @unknown default: return ""
             }
+        } catch {
+            markClosed()
+            throw error
         }
     }
 
@@ -184,6 +179,21 @@ final class RealtimeConnection: @unchecked Sendable {
         lock.lock(); callback = cb; lock.unlock()
     }
 
+    private var _appOwned = false
+    /// connectRealtime took this connection: request status push never closes it.
+    var appOwned: Bool {
+        get { lock.locked { _appOwned } }
+        set { lock.locked { _appOwned = newValue } }
+    }
+
+    private var _opening: Task<Void, Error>?
+    /// The first open of a connection request status push started, while it runs: connectRealtime
+    /// waits for it instead of returning before a socket exists.
+    var opening: Task<Void, Error>? {
+        get { lock.locked { _opening } }
+        set { lock.locked { _opening = newValue } }
+    }
+
     var isOpen: Bool {
         lock.lock(); defer { lock.unlock() }
         return ws.map { !$0.isClosed } ?? false
@@ -230,7 +240,10 @@ final class RealtimeConnection: @unchecked Sendable {
                                                 - Double.random(in: 0..<1) * RealtimeConnection.renewJitter)
             return (old, generation, _room)
         }
-        if !renew { emit(RealtimeEvent(type: "success", message: "Connected to WebSocket server.")) }
+        if !renew {
+            emit(RealtimeEvent(type: "success", message: "Connected to WebSocket server."))
+            skapi.statusPush.connectionOpened(self)
+        }
         forgetOrder()
         if let r = joined {
             let at = await skapi.currentAccessToken() ?? ""
@@ -309,6 +322,7 @@ final class RealtimeConnection: @unchecked Sendable {
     private func drop(_ conn: WebSocketConnection, _ gen: Int) {
         guard current(gen) else { return }
         conn.close()
+        skapi?.statusPush.connectionLost(self)
         emit(RealtimeEvent(type: "error", message: "Skapi: WebSocket unexpected close."))
         scheduleReconnect(gen)
     }
@@ -367,6 +381,7 @@ final class RealtimeConnection: @unchecked Sendable {
                 text = try await conn.receive()
             } catch {
                 if current(gen) {
+                    skapi?.statusPush.connectionLost(self)
                     emit(RealtimeEvent(type: "error", message: "Skapi: WebSocket unexpected close."))
                     scheduleReconnect(gen)
                 } else {
@@ -413,6 +428,13 @@ final class RealtimeConnection: @unchecked Sendable {
         }
         if let batch = data["#batch"]?.array {
             for entry in batch { if let o = entry.object { await readFrame(o) } }
+            return
+        }
+        // A request status push (skapi-js 2.5.0 CSR_STATUS): no user sent it, so it is not a message for
+        // the app. The server sends it to every connection of the user, so it arrives here even when this
+        // app never asked for `notify` (another client of the same user did).
+        if StatusPush.isStatusFrame(data) {
+            skapi?.statusPush.onFrame(data, from: self)
             return
         }
         var kind: String?
@@ -582,6 +604,7 @@ final class RealtimeConnection: @unchecked Sendable {
         lock.unlock()
         w?.close()
         forgetOrder()
+        skapi?.statusPush.connectionLost(self)
     }
 }
 
@@ -598,9 +621,22 @@ extension Skapi {
         if !(await signedIn()) { throw SkapiError("No access.", code: "INVALID_REQUEST") }
         if let r = rt, !r.isClosing {
             r.setCallback(callback)
+            r.appOwned = true  // opened for request status push: the app owns it now
+            statusPush.appAdopted(r)
+            if let opening = r.opening {
+                // request status push is still opening it: returns once connected, as for a new one
+                do {
+                    try await opening.value
+                } catch {
+                    if rt === r { rt = nil }
+                    r.emit(RealtimeEvent(type: "error", message: "Skapi: WebSocket connection failed."))
+                    throw error
+                }
+            }
             return
         }
         let r = RealtimeConnection(skapi: self, callback: callback)
+        r.appOwned = true
         rt = r
         do {
             try await r.open()

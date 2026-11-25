@@ -15,8 +15,12 @@ struct NetworkFailure: Error {
     let underlying: Error
 
     /// TIMEOUT when nothing moved for `timeout` seconds (URLRequest.timeoutInterval is an idle limit),
-    /// as skapi-js 2.4.4 does ("No response for 60 seconds."); NETWORK_ERROR for any other failure.
+    /// as skapi-js 2.4.4 does ("No response for 60 seconds."); ABORTED when the calling Task was
+    /// cancelled (skapi-js 2.7.0 `signal`); NETWORK_ERROR for any other failure.
     func skapiError(timeout: TimeInterval) -> SkapiError {
+        if (underlying as? URLError)?.code == .cancelled || underlying is CancellationError {
+            return SkapiError("Aborted", code: "ABORTED", cause: underlying)
+        }
         if (underlying as? URLError)?.code == .timedOut {
             return SkapiError("No response for \(Int(timeout)) seconds.", code: "TIMEOUT", cause: underlying)
         }
@@ -25,8 +29,13 @@ struct NetworkFailure: Error {
 }
 
 enum HTTP {
+    /// Cancelling the calling Task cancels the request on the network too (it then fails with
+    /// URLError.cancelled, which the callers report as ABORTED).
     static func send(_ request: URLRequest, session: URLSession = .shared) async throws -> HTTPAnswer {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HTTPAnswer, Error>) in
+        if Task.isCancelled { throw NetworkFailure(underlying: CancellationError()) }
+        let holder = DataTaskHolder()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<HTTPAnswer, Error>) in
             let task = session.dataTask(with: request) { data, response, error in
                 if let error = error {
                     cont.resume(throwing: NetworkFailure(underlying: error))
@@ -42,8 +51,35 @@ enum HTTP {
                 }
                 cont.resume(returning: HTTPAnswer(status: http.statusCode, headers: headers, body: data ?? Data()))
             }
+            holder.set(task)
             task.resume()
+            }
+        } onCancel: {
+            holder.cancel()
         }
+    }
+}
+
+/// The data task of one HTTP.send, so a Task cancellation can reach it.
+private final class DataTaskHolder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: URLSessionDataTask?
+    private var cancelled = false
+
+    func set(_ t: URLSessionDataTask) {
+        let cancelNow: Bool = lock.locked {
+            task = t
+            return cancelled
+        }
+        if cancelNow { t.cancel() }
+    }
+
+    func cancel() {
+        let t: URLSessionDataTask? = lock.locked {
+            cancelled = true
+            return task
+        }
+        t?.cancel()
     }
 }
 
@@ -124,10 +160,23 @@ final class Requester: @unchecked Sendable {
         do {
             answer = try await HTTP.send(req, session: session)
         } catch let e as NetworkFailure {
-            throw SkapiError("Network error", code: "NETWORK_ERROR", cause: e.underlying)
+            throw e.skapiError(timeout: timeout)
         }
-        guard (200..<300).contains(answer.status), let v = try? JSON.parse(answer.body), let o = v.object else {
+        // Only the CDN's "no such file" (403 or 404) means the project does not exist. Anything else is
+        // a failure on the way, reported with a code a caller (and a poll) retries: before, a passing
+        // CDN error or a cut-off answer said "The project ID does not exist", and the next call, which
+        // fetches the list again, worked.
+        if answer.status == 403 || answer.status == 404 {
             throw SkapiError("The project ID does not exist. Create your project from skapi.com", code: "NOT_EXISTS")
+        }
+        if answer.status == 429 {
+            throw SkapiError("Too many requests", code: "RATE_LIMITED")
+        }
+        guard (200..<300).contains(answer.status) else {
+            throw SkapiError("Server error \(answer.status).", code: "SERVER_ERROR")
+        }
+        guard let v = try? JSON.parse(answer.body), let o = v.object else {
+            throw SkapiError("Network error: the project's endpoint list \"\(name)\" arrived incomplete.", code: "NETWORK_ERROR")
         }
         return o
     }
@@ -372,19 +421,48 @@ final class Requester: @unchecked Sendable {
                         let carried = Requester.parseError(status: 429, text: text)
                         if carried.code != "ERROR" && carried.code != "429" { throw carried }
                     }
-                    throw SkapiError("Too many requests", code: "ERROR")
+                    // skapi-js 2.7.0: RATE_LIMITED on the request path; an upload says TOO_MANY_REQUESTS
+                    // (skapi-js toFileUploadError).
+                    throw SkapiError("Too many requests", code: uploadName == nil ? "RATE_LIMITED" : "TOO_MANY_REQUESTS")
                 }
                 if attempt >= Requester.rateLimitMaxRetries {
                     let bare = url.split(separator: "?", maxSplits: 1).first.map(String.init) ?? url
                     throw SkapiError("Too many requests: \"\(bare)\" still answered 429 after \(Requester.rateLimitMaxRetries) retries.",
                                      code: "TOO_MANY_REQUESTS")
                 }
-                try await Task.sleep(nanoseconds: UInt64(Requester.rateLimitWaitMs(delay, attempt: attempt) * 1_000_000))
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(Requester.rateLimitWaitMs(delay, attempt: attempt) * 1_000_000))
+                } catch {
+                    throw abortedError()  // cancelled while waiting out Retry-After: ABORTED, as any cancel
+                }
                 attempt += 1
                 continue
             }
+            // A server fault, not a refusal (skapi-js 2.7.0): SERVER_ERROR whatever the body says, so a
+            // caller can tell "try again" from "no". Uploads keep the storage service's own code, as in
+            // skapi-js.
+            if uploadName == nil { throw Requester.serverFault(status: answer.status, text: text) ?? Requester.parseError(status: answer.status, text: text) }
             throw Requester.parseError(status: answer.status, text: text)
         }
+    }
+
+    /// SERVER_ERROR for a 5xx answer other than 501 (which says the route does not exist here, an
+    /// answer), with the body kept as the cause; nil for any other status.
+    static func serverFault(status: Int, text: String) -> SkapiError? {
+        guard status >= 500 && status != 501 else { return nil }
+        let body = (try? JSON.parse(text)) ?? .string(text)
+        if case .string(let s) = body {
+            let parts = s.components(separatedBy: ":")
+            let message = parts.dropFirst().joined(separator: ":").trimmingCharacters(in: .whitespacesAndNewlines)
+            let shown = !message.isEmpty ? message : (!s.isEmpty ? s : "Server error \(status).")
+            return SkapiError(shown, code: "SERVER_ERROR", cause: body)
+        }
+        if let o = body.object, o.contains("message") || o.contains("stage") || o.contains("code") {
+            var message = (o["message"]?.string ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if message.isEmpty { message = o["code"].flatMap { $0.truthy ? $0.pyString : nil } ?? String(status) }
+            return SkapiError(message, code: "SERVER_ERROR", cause: o["cause"] ?? body)
+        }
+        return SkapiError("Server error \(status).", code: "SERVER_ERROR", cause: body)
     }
 
     static func retryDelayMs(_ value: String?) -> Double? {

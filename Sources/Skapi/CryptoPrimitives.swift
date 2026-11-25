@@ -45,8 +45,10 @@ enum Prim {
     /// PBKDF2-HMAC-SHA256.
     static func pbkdf2SHA256(password: Data, salt: Data, iterations: Int, length: Int = 32) -> Data {
         #if canImport(CommonCrypto)
-        var out = Data(count: length)
-        let status = out.withUnsafeMutableBytes { outPtr -> Int32 in
+        // Its own name: the portable path below declares `out` in the same scope, and two `var out`
+        // in one function body do not compile where CommonCrypto exists (macOS, iOS).
+        var nativeOutput = Data(count: length)
+        let status = nativeOutput.withUnsafeMutableBytes { outPtr -> Int32 in
             password.withUnsafeBytes { pwPtr -> Int32 in
                 salt.withUnsafeBytes { saltPtr -> Int32 in
                     CCKeyDerivationPBKDF(CCPBKDFAlgorithm(kCCPBKDF2),
@@ -57,7 +59,7 @@ enum Prim {
                 }
             }
         }
-        if status == 0 { return out }
+        if status == 0 { return nativeOutput }
         #endif
         let key = SymmetricKey(data: password)
         var out = Data()

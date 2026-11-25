@@ -41,6 +41,13 @@ public struct FetchOptions: Sendable {
 /// Skapi is an actor: every call is `await`ed, and calls from many tasks at once are safe.
 public actor Skapi {
     static let tokenRefreshSkew: Double = 60 * 60  // refresh the ID token when it has less than an hour left
+    /// How long a request waits for a token refresh (skapi-js 2.7.0). A refresh whose connection stalls
+    /// instead of failing would otherwise hold every signed-in call. Past this the waiting call fails
+    /// with code TIMEOUT, the user stays signed in, and the next call starts a new refresh.
+    static let tokenRefreshTimeLimit: Double = 15
+
+    /// Request status push (`notify`, onRequestStatus). Its own lock, reachable without the actor.
+    nonisolated let statusPush = StatusPush()
 
     /// The compact Project ID.
     public nonisolated let projectId: String
@@ -67,6 +74,12 @@ public actor Skapi {
     var restoreDone = false
     var connectionTask: Task<JSONObject, Error>?
     var refreshTask: Task<Void, Error>?
+    /// The number of the refresh in `refreshTask`. Refreshes are numbered in the order they start.
+    var refreshTaskSeq = 0
+    var refreshSeq = 0
+    /// A refresh numbered below this is not adopted: a newer one was adopted, or one asking for new
+    /// claims (after a profile change) started, so its tokens could carry the old claims.
+    var adoptFloor = 0
     /// Counts sign-outs: a token refresh that started before a sign-out compares it before adopting
     /// its tokens, so a refresh still running when the user logged out cannot sign them back in.
     var signOuts = 0
@@ -265,16 +278,43 @@ public actor Skapi {
         return userObj != nil && sess != nil
     }
 
-    /// Forced token refresh. A network failure keeps the session; any other refusal ends it.
-    func refreshSession() async throws {
-        if let t = refreshTask { _ = try? await t.value }
-        let t = Task { try await self.performRefresh() }
+    /// Forced token refresh. A network failure keeps the session; any other refusal ends it. Joins a
+    /// refresh already running, and waits at most `tokenRefreshTimeLimit` seconds (then TIMEOUT,
+    /// session kept). Cancelling the calling Task ends the wait with ABORTED; the refresh goes on.
+    ///
+    /// newClaims: the caller just changed the user (updateProfile, verifyEmail, ...) and needs tokens
+    /// issued after this call. It starts its own refresh at once, and a refresh that started earlier
+    /// is no longer adopted (it could carry the old claims). As in skapi-js, this wait has no time limit.
+    func refreshSession(newClaims: Bool = false) async throws {
+        if !newClaims, let t = refreshTask {
+            try await waitForRefresh(t)
+            return
+        }
+        refreshSeq += 1
+        let seq = refreshSeq
+        if newClaims { adoptFloor = max(adoptFloor, seq) }
+        let t = Task { try await self.performRefresh(seq) }
         refreshTask = t
-        defer { if refreshTask == t { refreshTask = nil } }
-        try await t.value
+        refreshTaskSeq = seq
+        try await waitForRefresh(t, limited: !newClaims)
     }
 
-    private func performRefresh() async throws {
+    /// Waits for a refresh, at most `tokenRefreshTimeLimit` seconds when `limited`. Past it the refresh
+    /// stops being shared (the next call starts a new one) and this fails with TIMEOUT; the session is
+    /// kept.
+    private func waitForRefresh(_ t: Task<Void, Error>, limited: Bool = true) async throws {
+        do {
+            try await raceTimeout(seconds: limited ? Skapi.tokenRefreshTimeLimit : nil, t,
+                                  timeoutError: SkapiError("The sign-in token refresh did not answer within \(Int(Skapi.tokenRefreshTimeLimit)) seconds.",
+                                                           code: "TIMEOUT"))
+        } catch let e as SkapiError where e.code == "TIMEOUT" {
+            if refreshTask == t { refreshTask = nil }
+            throw e
+        }
+    }
+
+    private func performRefresh(_ seq: Int) async throws {
+        defer { if refreshTaskSeq == seq { refreshTask = nil } }
         guard let s = sess, let username = cognitoUsername else { throw SkapiError("User login is required.", code: "INVALID_REQUEST") }
         let epoch = signOuts
         let pool = try await userPool()
@@ -288,6 +328,13 @@ public actor Skapi {
             throw SkapiError("User login is required.", code: "INVALID_REQUEST", cause: e)
         }
         if signOuts != epoch { try signedOutMeanwhile(pool, username) }
+        if seq < adoptFloor {
+            // A newer refresh was adopted, or one asking for new claims started, meanwhile: these tokens
+            // are older than that, so the current session stays, also in storage.
+            if let cur = sess, let u = cognitoUsername { pool.cacheTokens(u, cur) }
+            return
+        }
+        adoptFloor = seq
         try adoptSession(username, fresh)
     }
 
@@ -307,7 +354,7 @@ public actor Skapi {
         }
         let now = Date().timeIntervalSince1970
         if s.idToken.expiration < now + Skapi.tokenRefreshSkew {
-            if let t = refreshTask { try await t.value }  // another call is refreshing: share it
+            if let t = refreshTask { try await waitForRefresh(t) }  // another call is refreshing: share it
             guard let s2 = sess else { throw SkapiError("User login is required.", code: "INVALID_REQUEST") }
             if s2.idToken.expiration < Date().timeIntervalSince1970 + Skapi.tokenRefreshSkew { try await refreshSession() }
         }
@@ -324,9 +371,19 @@ public actor Skapi {
     func call(_ path: String, _ data: JSON? = nil, auth: Bool = false, method: String = "POST",
               fetchOptions: JSONObject? = nil, ignoreService: Bool = false) async throws -> JSON {
         try await ensureConnection()
-        let token = auth ? try await freshIdToken() : nil
+        let token = auth ? try await tokenForRequest() : nil
         return try await requester.request(path, data, auth: auth, method: method, token: token, fetchOptions: fetchOptions,
                                            ignoreService: ignoreService)
+    }
+
+    /// freshIdToken for a request, with a failure marked `isTokenFailure` (the request was never sent).
+    func tokenForRequest() async throws -> String {
+        do {
+            return try await freshIdToken()
+        } catch var e as SkapiError {
+            e.isTokenFailure = true
+            throw e
+        }
     }
 
     /// The signed-in user's profile, or nil.

@@ -24,7 +24,7 @@ final class RecordDecodingTests: XCTestCase {
     }
 
     func testVersion() {
-        XCTAssertEqual(skapiVersion, "2.5.0")
+        XCTAssertEqual(skapiVersion, "2.7.0")
     }
 
     func testSourceDefaultsIncludeCanModifyReferencingRecords() async throws {

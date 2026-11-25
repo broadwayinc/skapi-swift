@@ -51,7 +51,8 @@ extension Skapi {
     func startLifecycleIfNeeded() {
         guard observeAppLifecycle, lifecycle == nil else { return }
         lifecycle = LifecycleObserver { [weak self] in
-            Task { await self?.appDidReturn() }
+            guard let skapi = self else { return }
+            Task { await skapi.appDidReturn() }
         }
     }
 

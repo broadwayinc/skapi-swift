@@ -201,7 +201,7 @@ extension Skapi {
                 // the stored tokens had expired and were just refreshed: one refresh, not two
                 restoreRefreshedToken = nil
             } else {
-                try await refreshSession()
+                try await refreshSession(newClaims: true)
             }
             return userObj.map { .object($0) }
         } catch {
@@ -411,7 +411,7 @@ extension Skapi {
             } catch let err as CognitoError {
                 throw SkapiError(err.message ?? "Failed to update user settings.", code: err.code, cause: err)
             }
-            try await refreshSession()
+            try await refreshSession(newClaims: true)
         }
         return profile
     }
@@ -507,7 +507,7 @@ extension Skapi {
         do {
             if let c = code, !c.isEmpty {
                 _ = try await userPool().call("VerifyUserAttribute", accessToken: accessToken(), ["AttributeName": "email", "Code": .string(c)])
-                try await refreshSession()
+                try await refreshSession(newClaims: true)
                 userObj?["email_verified"] = true
                 return "SUCCESS: \"email\" is verified."
             }
@@ -528,7 +528,7 @@ extension Skapi {
         if let r = revert { body["revert"] = .bool(r) }
         let reply = try await call("last-verified-email", .object(body), auth: true)
         if let s = reply.string, s.contains("SUCCESS") {
-            try await refreshSession()
+            try await refreshSession(newClaims: true)
             return profile
         }
         return reply

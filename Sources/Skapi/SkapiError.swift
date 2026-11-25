@@ -9,6 +9,10 @@ public struct SkapiError: Error, CustomStringConvertible, LocalizedError, @unche
     public let code: String
     public let message: String
     public let cause: Any?
+    /// True when the request failed before it was sent because no sign-in token could be had (the
+    /// refresh got no answer or ran past its time limit, or the session is gone). The server never
+    /// saw it. skapi-js 2.7.0 isTokenFailure.
+    public internal(set) var isTokenFailure = false
 
     public init(_ message: String, code: String = "ERROR", cause: Any? = nil) {
         self.message = message
@@ -20,8 +24,8 @@ public struct SkapiError: Error, CustomStringConvertible, LocalizedError, @unche
     public var errorDescription: String? { description }
 }
 
-/// The SDK version. 2.5.0 has the record changes of skapi-js 2.6.0 and skapi-py 2.5.0.
-public let skapiVersion = "2.5.0"
+/// The SDK version, aligned with skapi-js 2.7.0.
+public let skapiVersion = "2.7.0"
 
 func paramError(_ message: String, _ code: String = "INVALID_PARAMETER") -> SkapiError {
     SkapiError(message, code: code)
