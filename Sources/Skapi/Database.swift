@@ -936,6 +936,10 @@ extension Skapi {
     }
 
     /// Who can read a private record, or which private records a user can read.
+    /// Only users with access to the data can list: a record's grants by its uploader, the users it was
+    /// shared with, the users with private access to the record it references, the project owner and
+    /// admins in access group 99; a user's grants (user_id alone) by that user, the project owner and
+    /// admins in access group 99. Anyone else gets INVALID_REQUEST.
     public func listPrivateRecordAccess(_ params: JSON, fetchOptions: FetchOptions? = nil) async throws -> JSON {
         let rid: JSON? = params["record_id"].truthy ? params["record_id"] : nil
         let uid: JSON? = params["user_id"].truthy ? params["user_id"] : nil
@@ -977,6 +981,7 @@ extension Skapi {
     }
 
     /// A key that opens a private record you were granted (cached until shortly before it expires).
+    /// With `reference_id`, the key is given only when `record_id` references that record directly and you uploaded it or were granted it, or when you were granted that record itself.
     public func requestPrivateRecordAccessKey(_ params: JSON) async throws -> String {
         let rid = params["record_id"], ref = params["reference_id"]
         guard let r = rid, r.truthy else { throw DB.err("Record ID is required.") }
